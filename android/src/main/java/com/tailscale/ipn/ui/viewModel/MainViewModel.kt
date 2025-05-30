@@ -4,6 +4,7 @@
 package com.tailscale.ipn.ui.viewModel
 
 import android.content.Intent
+import android.net.Uri
 import android.net.VpnService
 import androidx.activity.result.ActivityResultLauncher
 import androidx.compose.runtime.getValue
@@ -11,6 +12,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -25,6 +27,7 @@ import com.tailscale.ipn.ui.util.PeerCategorizer
 import com.tailscale.ipn.ui.util.PeerSet
 import com.tailscale.ipn.ui.util.TimeUtil
 import com.tailscale.ipn.ui.util.set
+import com.tailscale.ipn.util.TSLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
@@ -62,6 +65,11 @@ class MainViewModel(private val vpnViewModel: VpnViewModel) : IpnViewModel() {
   private var vpnPermissionLauncher: ActivityResultLauncher<Intent>? = null
   private val _requestVpnPermission = MutableStateFlow(false)
   val requestVpnPermission: StateFlow<Boolean> = _requestVpnPermission
+
+  // Select Taildrop directory
+  private var directoryPickerLauncher: ActivityResultLauncher<Uri?>? = null
+  private val _showDirectoryPickerInterstitial = MutableStateFlow(false)
+  val showDirectoryPickerInterstitial: StateFlow<Boolean> = _showDirectoryPickerInterstitial
 
   // The list of peers
   private val _peers = MutableStateFlow<List<PeerSet>>(emptyList())
@@ -204,6 +212,31 @@ class MainViewModel(private val vpnViewModel: VpnViewModel) : IpnViewModel() {
     _requestVpnPermission.value = false // reset
   }
 
+  fun showDirectoryPickerLauncher() {
+    _showDirectoryPickerInterstitial.set(false)
+    directoryPickerLauncher?.launch(null)
+  }
+
+  fun checkIfTaildropDirectorySelected() {
+    val app = App.get()
+    val storedUri = app.getStoredDirectoryUri()
+    if (storedUri == null) {
+      // No stored URI, so launch the directory picker.
+      _showDirectoryPickerInterstitial.set(true)
+      return
+    }
+
+    val documentFile = DocumentFile.fromTreeUri(app, storedUri)
+    if (documentFile == null || !documentFile.exists() || !documentFile.canWrite()) {
+      TSLog.d(
+          "MainViewModel",
+          "Stored directory URI is invalid or inaccessible; launching directory picker.")
+      _showDirectoryPickerInterstitial.set(true)
+    } else {
+      TSLog.d("MainViewModel", "Using stored directory URI: $storedUri")
+    }
+  }
+
   fun toggleVpn(desiredState: Boolean) {
     if (isToggleInProgress.value) {
       // Prevent toggling while a previous toggle is in progress
@@ -211,6 +244,7 @@ class MainViewModel(private val vpnViewModel: VpnViewModel) : IpnViewModel() {
     }
 
     viewModelScope.launch {
+      checkIfTaildropDirectorySelected()
       isToggleInProgress.value = true
       try {
         val currentState = Notifier.state.value
@@ -249,6 +283,10 @@ class MainViewModel(private val vpnViewModel: VpnViewModel) : IpnViewModel() {
   fun setVpnPermissionLauncher(launcher: ActivityResultLauncher<Intent>) {
     // No intent means we're already authorized
     vpnPermissionLauncher = launcher
+  }
+
+  fun setDirectoryPickerLauncher(launcher: ActivityResultLauncher<Uri?>) {
+    directoryPickerLauncher = launcher
   }
 }
 
