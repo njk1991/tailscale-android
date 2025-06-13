@@ -32,6 +32,7 @@ import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -61,12 +62,14 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -78,11 +81,13 @@ import com.tailscale.ipn.App
 import com.tailscale.ipn.R
 import com.tailscale.ipn.mdm.MDMSettings
 import com.tailscale.ipn.mdm.ShowHide
+import com.tailscale.ipn.ui.Links
 import com.tailscale.ipn.ui.model.Ipn
 import com.tailscale.ipn.ui.model.IpnLocal
 import com.tailscale.ipn.ui.model.Netmap
 import com.tailscale.ipn.ui.model.Permissions
 import com.tailscale.ipn.ui.model.Tailcfg
+import com.tailscale.ipn.ui.theme.AppTheme
 import com.tailscale.ipn.ui.theme.customErrorContainer
 import com.tailscale.ipn.ui.theme.disabled
 import com.tailscale.ipn.ui.theme.errorButton
@@ -123,7 +128,7 @@ data class MainViewNavigation(
 fun MainView(
     loginAtUrl: (String) -> Unit,
     navigation: MainViewNavigation,
-    viewModel: MainViewModel
+    viewModel: MainViewModel,
 ) {
   val currentPingDevice by viewModel.pingViewModel.peer.collectAsState()
   val healthIcon by viewModel.healthIcon.collectAsState()
@@ -146,6 +151,8 @@ fun MainView(
             val showExitNodePicker by MDMSettings.exitNodesPicker.flow.collectAsState()
             val disableToggle by MDMSettings.forceEnabled.flow.collectAsState()
             val showKeyExpiry by viewModel.showExpiry.collectAsState(initial = false)
+            val showDirectoryPickerInterstitial by
+                viewModel.showDirectoryPickerInterstitial.collectAsState()
 
             // Hide the header only on Android TV when the user needs to login
             val hideHeader = (isAndroidTV() && state == Ipn.State.NeedsLogin)
@@ -208,10 +215,17 @@ fun MainView(
 
             when (state) {
               Ipn.State.Running -> {
-
-                PromptPermissionsIfNecessary()
                 viewModel.maybeRequestVpnPermission()
                 LaunchVpnPermissionIfNeeded(viewModel)
+                PromptForMissingPermissions(viewModel)
+
+                if (!viewModel.skipPromptsForAuthKeyLogin()) {
+                  LaunchedEffect(state) {
+                    if (state == Ipn.State.Running && !isAndroidTV()) {
+                      viewModel.checkIfTaildropDirectorySelected()
+                    }
+                  }
+                }
 
                 if (showKeyExpiry) {
                   ExpiryNotification(netmap = netmap, action = { viewModel.login() })
@@ -245,14 +259,46 @@ fun MainView(
                     { viewModel.showVPNPermissionLauncherIfUnauthorized() })
               }
             }
-          }
 
+            showDirectoryPickerInterstitial.let { show ->
+              if (show) {
+                AppTheme {
+                  AlertDialog(
+                      onDismissRequest = { viewModel.showDirectoryPickerLauncher() },
+                      title = {
+                        Text(text = stringResource(id = R.string.taildrop_directory_picker_title))
+                      },
+                      text = { TaildropDirectoryPickerPrompt() },
+                      confirmButton = {
+                        PrimaryActionButton(onClick = { viewModel.showDirectoryPickerLauncher() }) {
+                          Text(
+                              text = stringResource(id = R.string.taildrop_directory_picker_button))
+                        }
+                      })
+                }
+              }
+            }
+          }
       currentPingDevice?.let { _ ->
         ModalBottomSheet(onDismissRequest = { viewModel.onPingDismissal() }) {
           PingView(model = viewModel.pingViewModel)
         }
       }
     }
+  }
+}
+
+@Composable
+fun TaildropDirectoryPickerPrompt() {
+  val uriHandler = LocalUriHandler.current
+
+  Column(verticalArrangement = Arrangement.spacedBy(8.dp), horizontalAlignment = Alignment.Start) {
+    Text(text = stringResource(id = R.string.taildrop_directory_picker_body))
+    Text(
+        text = stringResource(id = R.string.taildrop_directory_picker_info),
+        modifier = Modifier.clickable { uriHandler.openUri(Links.TAILDROP_KB_URL) },
+        color = MaterialTheme.colorScheme.primary,
+        textDecoration = TextDecoration.Underline)
   }
 }
 
@@ -433,11 +479,11 @@ fun ConnectView(
     loginAction: () -> Unit,
     loginAtUrlAction: (String) -> Unit,
     selfNode: Tailcfg.Node?,
-    showVPNPermissionLauncherIfUnauthorized: () -> Unit
+    showVPNPermissionLauncher: () -> Unit,
 ) {
   LaunchedEffect(isPrepared) {
     if (!isPrepared && shouldStartAutomatically) {
-      showVPNPermissionLauncherIfUnauthorized()
+      showVPNPermissionLauncher()
     }
   }
   Row(horizontalArrangement = Arrangement.Center, modifier = Modifier.fillMaxWidth()) {
@@ -545,7 +591,7 @@ fun PeerList(
     viewModel: MainViewModel,
     onNavigateToPeerDetails: (Tailcfg.Node) -> Unit,
     onSearchBarClick: () -> Unit,
-    onSearch: (String) -> Unit
+    onSearch: (String) -> Unit,
 ) {
   val peerList by viewModel.peers.collectAsState(initial = emptyList<PeerSet>())
   val searchTermStr by viewModel.searchTerm.collectAsState(initial = "")
@@ -751,7 +797,11 @@ fun ExpiryNotification(netmap: Netmap.NetworkMap?, action: () -> Unit = {}) {
 
 @OptIn(ExperimentalPermissionsApi::class)
 @Composable
-fun PromptPermissionsIfNecessary() {
+fun PromptForMissingPermissions(viewModel: MainViewModel) {
+  if (viewModel.skipPromptsForAuthKeyLogin()) {
+    return
+  }
+
   Permissions.prompt.forEach { (permission, state) ->
     ErrorDialog(
         title = permission.title,
@@ -766,7 +816,7 @@ fun PromptPermissionsIfNecessary() {
 @Composable
 fun Search(
     onSearchBarClick: () -> Unit, // Callback for navigating to SearchView
-    backgroundColor: Color = MaterialTheme.colorScheme.background // Default background color
+    backgroundColor: Color = MaterialTheme.colorScheme.background, // Default background color
 ) {
   // Prevent multiple taps
   var isNavigating by remember { mutableStateOf(false) }
